@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: logdrk-server
+    env: node
+    buildCommand: npm install
+    startCommand: node server.js
+    envVars:
+      - key: SERVER_SECRET
+        sync: false
+      - key: WHATSAPP_GROUP_ID
+        sync: false
+      - key: ZAPI_adm
+        sync: false
