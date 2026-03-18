@@ -7,6 +7,7 @@ const app  = express();
 const PORT = process.env.PORT || 3000;
 const SECRET = process.env.SERVER_SECRET || 'logdrk_secret';
 const GROUP_ID = process.env.WHATSAPP_GROUP_ID || '';
+const CLIENT_TOKEN = process.env.ZAPI_CLIENT_TOKEN || '';
 
 app.use(cors());
 app.use(express.json());
@@ -24,7 +25,7 @@ async function sendToGroup(zapiConfig, message) {
   const response = await axios.post(`${zapiConfig.url}/send-text`, {
     phone: GROUP_ID,
     message: message,
-  }, { headers: { 'Content-Type': 'application/json' }, timeout: 10000 });
+  }, { headers: { 'Content-Type': 'application/json', 'Client-Token': CLIENT_TOKEN }, timeout: 10000 });
   return response.data;
 }
 
