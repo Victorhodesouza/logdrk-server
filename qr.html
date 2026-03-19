@@ -1,0 +1,49 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>QR Code WhatsApp</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
+</head>
+<body style="display:flex;flex-direction:column;align-items:center;justify-content:center;min-height:100vh;margin:0;font-family:sans-serif;background:#fff;">
+<h2>WhatsApp QR Code</h2>
+<div id="status" style="margin:10px;font-size:16px;color:#666;">Carregando...</div>
+<div id="qrcode" style="margin:20px;"></div>
+<div id="msg" style="color:green;font-size:18px;"></div>
+<script>
+const SECRET = 'logdrk_secret';
+const SERVER = 'https://logdrk-server-production.up.railway.app';
+let qrObj = null;
+
+async function check() {
+  try {
+    const r = await fetch(`${SERVER}/qr?secret=${SECRET}`);
+    const d = await r.json();
+    if (d.status === 'conectado') {
+      document.getElementById('status').textContent = '✅ WhatsApp conectado!';
+      document.getElementById('qrcode').innerHTML = '';
+      document.getElementById('msg').textContent = 'Pode fechar esta página.';
+      return;
+    }
+    if (d.qr) {
+      document.getElementById('status').textContent = '📱 Escaneie com o WhatsApp:';
+      if (!qrObj) {
+        qrObj = new QRCode(document.getElementById('qrcode'), {
+          text: d.qr, width: 300, height: 300,
+          colorDark: '#000', colorLight: '#fff',
+          correctLevel: QRCode.CorrectLevel.L
+        });
+      } else {
+        qrObj.clear();
+        qrObj.makeCode(d.qr);
+      }
+    }
+  } catch(e) {
+    document.getElementById('status').textContent = 'Erro ao conectar ao servidor.';
+  }
+  setTimeout(check, 8000);
+}
+check();
+</script>
+</body>
+</html>
