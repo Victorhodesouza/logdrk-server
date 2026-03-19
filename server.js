@@ -1,53 +1,116 @@
 require('dotenv').config();
 const express = require('express');
-const cors    = require('cors');
-const axios   = require('axios');
+const cors = require('cors');
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } = require('@whiskeysockets/baileys');
+const { Boom } = require('@hapi/boom');
+const pino = require('pino');
+const path = require('path');
+const fs = require('fs');
 
-const app  = express();
+const app = express();
 const PORT = process.env.PORT || 3000;
 const SECRET = process.env.SERVER_SECRET || 'logdrk_secret';
 const GROUP_ID = process.env.WHATSAPP_GROUP_ID || '';
-const CLIENT_TOKEN = process.env.ZAPI_CLIENT_TOKEN || '';
 
 app.use(cors());
 app.use(express.json());
 
-function getZapiConfig(username) {
-  const key = `ZAPI_${username.toLowerCase()}`;
-  const val = process.env[key];
-  if (!val) return null;
-  const [instanceId, token] = val.split(':');
-  if (!instanceId || !token) return null;
-  return { url: `https://api.z-api.io/instances/${instanceId}/token/${token}`, instanceId, token };
+let sock = null;
+let isConnected = false;
+let qrCode = null;
+
+const AUTH_FOLDER = path.join(__dirname, 'auth_info');
+
+async function connectWhatsApp() {
+  const { state, saveCreds } = await useMultiFileAuthState(AUTH_FOLDER);
+  const { version } = await fetchLatestBaileysVersion();
+
+  sock = makeWASocket({
+    version,
+    auth: state,
+    printQRInTerminal: true,
+    logger: pino({ level: 'silent' }),
+  });
+
+  sock.ev.on('creds.update', saveCreds);
+
+  sock.ev.on('connection.update', (update) => {
+    const { connection, lastDisconnect, qr } = update;
+
+    if (qr) {
+      qrCode = qr;
+      console.log('\n📱 QR CODE GERADO — escaneie pelo WhatsApp no celular!');
+    }
+
+    if (connection === 'close') {
+      isConnected = false;
+      qrCode = null;
+      const shouldReconnect = (lastDisconnect?.error instanceof Boom)
+        ? lastDisconnect.error.output.statusCode !== DisconnectReason.loggedOut
+        : true;
+      console.log('⚠️ Conexão encerrada. Reconectando:', shouldReconnect);
+      if (shouldReconnect) {
+        setTimeout(connectWhatsApp, 3000);
+      } else {
+        if (fs.existsSync(AUTH_FOLDER)) {
+          fs.rmSync(AUTH_FOLDER, { recursive: true });
+        }
+        setTimeout(connectWhatsApp, 3000);
+      }
+    }
+
+    if (connection === 'open') {
+      isConnected = true;
+      qrCode = null;
+      console.log('✅ WhatsApp conectado com sucesso!');
+      console.log(`📋 Grupo configurado: ${GROUP_ID || '⚠️ não configurado'}`);
+    }
+  });
 }
 
-async function sendToGroup(zapiConfig, message) {
-  const response = await axios.post(`${zapiConfig.url}/send-text`, {
-    phone: GROUP_ID,
-    message: message,
-  }, { headers: { 'Content-Type': 'application/json', 'Client-Token': CLIENT_TOKEN }, timeout: 10000 });
-  return response.data;
+async function sendToGroup(message) {
+  if (!isConnected || !sock) throw new Error('WhatsApp não conectado');
+  if (!GROUP_ID) throw new Error('WHATSAPP_GROUP_ID não configurado');
+  await sock.sendMessage(GROUP_ID, { text: message });
 }
+
+connectWhatsApp().catch(console.error);
 
 app.get('/', (req, res) => {
-  res.json({ status: 'online', app: 'Log DRK Server', version: '1.0.0', timestamp: new Date().toISOString() });
+  res.json({
+    status: 'online',
+    app: 'Log DRK Server',
+    version: '2.0.0',
+    whatsapp: isConnected ? 'conectado' : (qrCode ? 'aguardando_qr' : 'desconectado'),
+    timestamp: new Date().toISOString()
+  });
+});
+
+app.get('/qr', (req, res) => {
+  const secret = req.headers['x-secret'] || req.query.secret;
+  if (secret !== SECRET) return res.status(401).json({ ok: false, error: 'Não autorizado' });
+  if (isConnected) return res.json({ ok: true, status: 'conectado', message: 'WhatsApp já está conectado!' });
+  if (!qrCode) return res.json({ ok: false, status: 'aguardando', message: 'QR Code ainda não gerado. Aguarde e tente novamente.' });
+  res.json({ ok: true, status: 'qr_disponivel', qr: qrCode });
+});
+
+app.get('/status', (req, res) => {
+  const secret = req.headers['x-secret'] || req.query.secret;
+  if (secret !== SECRET) return res.status(401).json({ ok: false, error: 'Não autorizado' });
+  res.json({ ok: true, connected: isConnected, qrPending: !!qrCode, groupId: GROUP_ID || 'não configurado' });
 });
 
 app.post('/send-status', async (req, res) => {
   const { secret, username, message } = req.body;
   if (secret !== SECRET) return res.status(401).json({ ok: false, error: 'Não autorizado' });
   if (!username || !message) return res.status(400).json({ ok: false, error: 'username e message são obrigatórios' });
-  if (!GROUP_ID) return res.status(500).json({ ok: false, error: 'WHATSAPP_GROUP_ID não configurado' });
-  const zapiConfig = getZapiConfig(username);
-  if (!zapiConfig) return res.status(404).json({ ok: false, error: `Instância Z-API não encontrada para "${username}". Configure ZAPI_${username.toLowerCase()} no servidor.` });
   try {
-    const result = await sendToGroup(zapiConfig, message);
-    console.log(`[${new Date().toISOString()}] ✅ Mensagem enviada | Motorista: ${username}`);
-    return res.json({ ok: true, result });
+    await sendToGroup(message);
+    console.log(`[${new Date().toISOString()}] ✅ Status enviado | Motorista: ${username}`);
+    return res.json({ ok: true });
   } catch (err) {
-    const errMsg = err.response?.data || err.message;
-    console.error(`[${new Date().toISOString()}] ❌ Erro | Motorista: ${username} |`, errMsg);
-    return res.status(500).json({ ok: false, error: errMsg });
+    console.error(`[${new Date().toISOString()}] ❌ Erro | Motorista: ${username} |`, err.message);
+    return res.status(500).json({ ok: false, error: err.message });
   }
 });
 
@@ -55,56 +118,28 @@ app.post('/send-programacao', async (req, res) => {
   const { secret, message } = req.body;
   if (secret !== SECRET) return res.status(401).json({ ok: false, error: 'Não autorizado' });
   if (!message) return res.status(400).json({ ok: false, error: 'message é obrigatória' });
-  if (!GROUP_ID) return res.status(500).json({ ok: false, error: 'WHATSAPP_GROUP_ID não configurado' });
-  const zapiConfig = getZapiConfig('adm');
-  if (!zapiConfig) return res.status(404).json({ ok: false, error: 'Instância ADM não configurada. Configure ZAPI_adm.' });
   try {
-    const result = await sendToGroup(zapiConfig, message);
+    await sendToGroup(message);
     console.log(`[${new Date().toISOString()}] ✅ Programação enviada`);
-    return res.json({ ok: true, result });
+    return res.json({ ok: true });
   } catch (err) {
-    const errMsg = err.response?.data || err.message;
-    console.error(`[${new Date().toISOString()}] ❌ Erro programação |`, errMsg);
-    return res.status(500).json({ ok: false, error: errMsg });
-  }
-});
-
-app.get('/check-instance/:username', async (req, res) => {
-  const secret = req.headers['x-secret'];
-  if (secret !== SECRET) return res.status(401).json({ ok: false, error: 'Não autorizado' });
-  const { username } = req.params;
-  const zapiConfig = getZapiConfig(username);
-  if (!zapiConfig) return res.json({ ok: false, connected: false, error: `ZAPI_${username.toLowerCase()} não configurado` });
-  try {
-    const response = await axios.get(`${zapiConfig.url}/status`, { timeout: 8000 });
-    const connected = response.data?.connected === true || response.data?.status === 'connected';
-    return res.json({ ok: true, connected, data: response.data });
-  } catch (err) {
-    return res.json({ ok: false, connected: false, error: err.message });
+    console.error(`[${new Date().toISOString()}] ❌ Erro programação |`, err.message);
+    return res.status(500).json({ ok: false, error: err.message });
   }
 });
 
 app.get('/instances', (req, res) => {
   const secret = req.headers['x-secret'];
   if (secret !== SECRET) return res.status(401).json({ ok: false, error: 'Não autorizado' });
-  const instances = [];
-  Object.keys(process.env).forEach(key => {
-    if (key.startsWith('ZAPI_')) {
-      const username = key.replace('ZAPI_', '').toLowerCase();
-      const [instanceId] = (process.env[key] || '').split(':');
-      instances.push({ username, instanceId: instanceId || '?' });
-    }
-  });
-  res.json({ ok: true, instances, groupId: GROUP_ID || 'não configurado' });
+  res.json({ ok: true, instances: [{ username: 'adm', connected: isConnected }], groupId: GROUP_ID || 'não configurado' });
+});
+
+app.get('/check-instance/:username', (req, res) => {
+  const secret = req.headers['x-secret'];
+  if (secret !== SECRET) return res.status(401).json({ ok: false, error: 'Não autorizado' });
+  res.json({ ok: true, connected: isConnected });
 });
 
 app.listen(PORT, () => {
-  console.log(`\n🚛 Log DRK Server rodando na porta ${PORT}`);
-  console.log(`📋 Grupo: ${GROUP_ID || '⚠️ não configurado'}`);
-  const zapiKeys = Object.keys(process.env).filter(k => k.startsWith('ZAPI_'));
-  zapiKeys.forEach(k => {
-    const user = k.replace('ZAPI_', '');
-    const [id] = (process.env[k] || '').split(':');
-    console.log(`   📱 ${user}: ${id}`);
-  });
+  console.log(`\n🚛 Log DRK Server v2.0 rodando na porta ${PORT}`);
 });
