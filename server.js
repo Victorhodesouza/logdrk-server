@@ -269,6 +269,19 @@ app.post('/status', authMiddleware, async (req, res) => {
 
     // Enviar WhatsApp
     await sendToGroup(message);
+
+    // Disparar push para ADM (não bloqueia resposta)
+    const isAtraso = record.atraso === 'chegada' || record.atraso === 'saida';
+    if (typeof sendPushToAdmins === 'function') {
+      sendPushToAdmins({
+        title: isAtraso ? `⚠️ Atraso — ${record.driver}` : `🚛 ${record.driver}`,
+        body: record.status || 'Novo status registrado',
+        icon: '/icon-192.png',
+        tag: 'status-' + req.user.username,
+        urgent: isAtraso,
+      }).catch(() => {});
+    }
+
     console.log(`[${new Date().toISOString()}] ✅ Status | ${req.user.username} | ${record.status}`);
     res.json({ ok: true });
   } catch (err) {
@@ -463,7 +476,106 @@ app.get('/instances', (req, res) => {
   res.json({ ok: true, instances: [{ username: 'adm', connected: isConnected }], groupId: GROUP_ID || 'não configurado' });
 });
 
+// ═══════════════════════════════════════
+// WEB PUSH NOTIFICATIONS
+// ═══════════════════════════════════════
+const webpush = require('web-push');
+
+const VAPID_PUBLIC  = process.env.VAPID_PUBLIC_KEY  || '';
+const VAPID_PRIVATE = process.env.VAPID_PRIVATE_KEY || '';
+const VAPID_EMAIL   = process.env.VAPID_EMAIL || 'mailto:admin@logdrk.com';
+
+if (VAPID_PUBLIC && VAPID_PRIVATE) {
+  webpush.setVapidDetails(VAPID_EMAIL, VAPID_PUBLIC, VAPID_PRIVATE);
+  console.log('🔔 Web Push configurado');
+} else {
+  console.warn('⚠️ VAPID keys não configuradas — push desativado');
+}
+
+// Tabela para subscriptions
+db.exec(`
+  CREATE TABLE IF NOT EXISTS push_subscriptions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT NOT NULL,
+    endpoint TEXT NOT NULL UNIQUE,
+    p256dh TEXT NOT NULL,
+    auth TEXT NOT NULL,
+    created_at TEXT DEFAULT (datetime('now'))
+  );
+`);
+
+// Salvar subscription do browser
+app.post('/push/subscribe', authMiddleware, (req, res) => {
+  const { endpoint, keys } = req.body;
+  if (!endpoint || !keys?.p256dh || !keys?.auth) {
+    return res.status(400).json({ ok: false, error: 'Dados inválidos' });
+  }
+  db.prepare(`
+    INSERT INTO push_subscriptions (username, endpoint, p256dh, auth)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(endpoint) DO UPDATE SET
+      username=excluded.username,
+      p256dh=excluded.p256dh,
+      auth=excluded.auth
+  `).run(req.user.username, endpoint, keys.p256dh, keys.auth);
+  console.log(`[PUSH] ✅ Subscription salva: ${req.user.username}`);
+  res.json({ ok: true });
+});
+
+// Remover subscription (logout)
+app.delete('/push/subscribe', authMiddleware, (req, res) => {
+  const { endpoint } = req.body;
+  if (endpoint) db.prepare('DELETE FROM push_subscriptions WHERE endpoint = ?').run(endpoint);
+  res.json({ ok: true });
+});
+
+// Retornar VAPID public key para o app
+app.get('/push/vapid-key', (req, res) => {
+  res.json({ ok: true, publicKey: VAPID_PUBLIC });
+});
+
+// Função interna para enviar push para todos os admins
+async function sendPushToAdmins(payload) {
+  if (!VAPID_PUBLIC || !VAPID_PRIVATE) return;
+  const subs = db.prepare(`
+    SELECT ps.* FROM push_subscriptions ps
+    JOIN users u ON u.username = ps.username
+    WHERE u.role = 'admin'
+  `).all();
+  for (const sub of subs) {
+    try {
+      await webpush.sendNotification(
+        { endpoint: sub.endpoint, keys: { p256dh: sub.p256dh, auth: sub.auth } },
+        JSON.stringify(payload)
+      );
+    } catch (err) {
+      if (err.statusCode === 410 || err.statusCode === 404) {
+        // Subscription expirada — remove
+        db.prepare('DELETE FROM push_subscriptions WHERE endpoint = ?').run(sub.endpoint);
+      }
+      console.warn('[PUSH] Erro ao enviar:', err.message);
+    }
+  }
+}
+
+// Patch: interceptar /status para disparar push após salvar
+const _origStatusHandler = app._router.stack.find(r => r.route?.path === '/status');
+
+// Rota de teste push (ADM)
+app.post('/push/test', authMiddleware, admMiddleware, async (req, res) => {
+  await sendPushToAdmins({
+    title: '🚛 Log DRK — Teste',
+    body: 'Notificações funcionando!',
+    icon: '/icon-192.png',
+    tag: 'test'
+  });
+  res.json({ ok: true });
+});
+
+// Expor sendPushToAdmins para ser usada na rota /status
+app._sendPushToAdmins = sendPushToAdmins;
+
 app.listen(PORT, () => {
-  console.log(`\n🚛 Log DRK Server v3.0 rodando na porta ${PORT}`);
+  console.log(`\n🚛 Log DRK Server v3.1 rodando na porta ${PORT}`);
   console.log(`📦 Banco de dados: ${DB_PATH}`);
 });
